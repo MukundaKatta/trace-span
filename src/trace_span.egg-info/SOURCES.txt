@@ -1,0 +1,11 @@
+LICENSE
+README.md
+pyproject.toml
+src/trace_span/__init__.py
+src/trace_span/core.py
+src/trace_span/py.typed
+src/trace_span.egg-info/PKG-INFO
+src/trace_span.egg-info/SOURCES.txt
+src/trace_span.egg-info/dependency_links.txt
+src/trace_span.egg-info/top_level.txt
+tests/test_span.py
