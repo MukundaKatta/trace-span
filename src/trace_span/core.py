@@ -21,13 +21,21 @@ class Span:
     """A single timed span.
 
     Attributes:
-        name: span name (e.g. "llm_call", "web_search").
-        started_at: Unix timestamp when the span started.
-        ended_at: Unix timestamp when the span ended (None if still open).
+        name: span name (e.g. ``"llm_call"``, ``"web_search"``).
+        started_at: Unix wall-clock timestamp when the span started.
+        ended_at: Unix wall-clock timestamp when the span ended
+            (``None`` if still open).
         tags: key-value metadata attached at start.
         attrs: key-value attributes set during the span.
         error: error message if the span ended with an exception.
-        ok: True if the span completed without error.
+
+    Note:
+        ``duration_ms`` is measured with a monotonic clock
+        (:func:`time.perf_counter`) rather than the wall-clock
+        ``started_at`` / ``ended_at`` fields. This keeps durations accurate
+        and non-negative even if the system clock is adjusted (e.g. by NTP)
+        while a span is open. The wall-clock fields remain available for
+        human-readable timestamps and JSONL export.
     """
 
     name: str
@@ -36,12 +44,24 @@ class Span:
     tags: dict[str, Any] = field(default_factory=dict)
     attrs: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
+    # Monotonic clock readings, used purely for duration measurement. These
+    # are not serialized; spans loaded from disk fall back to the wall-clock
+    # timestamps. Excluded from __init__ so the public constructor signature
+    # (and existing call sites / tests) is unchanged.
+    _perf_start: float | None = field(default=None, repr=False, compare=False)
+    _perf_end: float | None = field(default=None, repr=False, compare=False)
 
     @property
     def duration_ms(self) -> float | None:
-        """Duration in milliseconds, or None if still open."""
+        """Duration in milliseconds, or ``None`` if still open.
+
+        Computed from a monotonic clock when available, falling back to the
+        wall-clock timestamps (used for spans reconstructed from JSONL).
+        """
         if self.ended_at is None:
             return None
+        if self._perf_start is not None and self._perf_end is not None:
+            return (self._perf_end - self._perf_start) * 1000
         return (self.ended_at - self.started_at) * 1000
 
     @property
@@ -60,7 +80,12 @@ class Span:
         return self
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize to a plain dict."""
+        """Serialize to a plain dict.
+
+        The returned dict is JSON-serializable and contains the public span
+        fields plus the computed ``duration_ms`` and ``ok`` values. The
+        internal monotonic-clock readings are intentionally omitted.
+        """
         return {
             "name": self.name,
             "started_at": self.started_at,
@@ -78,7 +103,7 @@ class Span:
 
 
 class _SpanContext:
-    """Context manager returned by SpanRecorder.span()."""
+    """Context manager returned by :meth:`SpanRecorder.span`."""
 
     def __init__(self, span: Span, recorder: "SpanRecorder") -> None:
         self._span = span
@@ -88,6 +113,7 @@ class _SpanContext:
         return self._span
 
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self._span._perf_end = time.perf_counter()
         self._span.ended_at = time.time()
         if exc_val is not None:
             self._span.error = str(exc_val)
@@ -113,7 +139,8 @@ class SpanRecorder:
         recorder.save("run.jsonl")
 
     Args:
-        path: optional JSONL file path; completed spans are appended there.
+        path: optional JSONL file path; completed spans are appended there
+            as they finish. The parent directory must already exist.
     """
 
     def __init__(self, path: str | Path | None = None) -> None:
@@ -137,7 +164,7 @@ class SpanRecorder:
             tags: optional key-value metadata.
 
         Returns:
-            Context manager; yields the Span object.
+            Context manager; yields the :class:`Span` object.
 
         Example::
 
@@ -150,6 +177,7 @@ class SpanRecorder:
             started_at=time.time(),
             tags=dict(tags) if tags else {},
         )
+        s._perf_start = time.perf_counter()
         return _SpanContext(s, self)
 
     # ------------------------------------------------------------------
@@ -157,17 +185,28 @@ class SpanRecorder:
     # ------------------------------------------------------------------
 
     def start(self, name: str, *, tags: dict[str, Any] | None = None) -> Span:
-        """Start a span without a context manager. Call finish() to end it."""
-        return Span(
+        """Start a span without a context manager. Call :meth:`finish` to end it."""
+        s = Span(
             name=name,
             started_at=time.time(),
             tags=dict(tags) if tags else {},
         )
+        s._perf_start = time.perf_counter()
+        return s
 
     def finish(self, span: Span, *, error: str | None = None) -> None:
-        """End a manually started span and record it."""
+        """End a manually started span and record it.
+
+        Args:
+            span: the open span returned by :meth:`start`.
+            error: optional error message to attach.
+
+        Raises:
+            SpanError: if the span has already been finished.
+        """
         if not span.is_open:
             raise SpanError(f"span {span.name!r} is already finished")
+        span._perf_end = time.perf_counter()
         span.ended_at = time.time()
         span.error = error
         self._record(span)
@@ -205,7 +244,7 @@ class SpanRecorder:
     # ------------------------------------------------------------------
 
     def save(self, path: str | Path) -> None:
-        """Save all spans to a JSONL file."""
+        """Save all spans to a JSONL file (one JSON object per line)."""
         p = Path(path)
         with p.open("w", encoding="utf-8") as f:
             for s in self._spans:
@@ -213,7 +252,12 @@ class SpanRecorder:
 
     @classmethod
     def load(cls, path: str | Path) -> "SpanRecorder":
-        """Load spans from a JSONL file."""
+        """Load spans from a JSONL file produced by :meth:`save` or live logging.
+
+        Blank lines are skipped. Durations on loaded spans are derived from
+        the stored wall-clock timestamps, since the monotonic-clock readings
+        are not persisted.
+        """
         recorder = cls()
         p = Path(path)
         for line in p.read_text(encoding="utf-8").splitlines():
